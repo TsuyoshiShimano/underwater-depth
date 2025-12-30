@@ -211,12 +211,24 @@ class MASt3RBaseStereoViewDataset(BaseStereoViewDataset):
                 assert np.isfinite(view['camera_pose']).all(), f'NaN in camera pose for view {view_name(view)}'
             assert 'pts3d' not in view
             assert 'valid_mask' not in view
-            assert np.isfinite(view['depthmap']).all(), f'NaN in depthmap for view {view_name(view)}'
+            nan_mask = None
+            if not np.isfinite(view['depthmap']).all():
+                nan_mask = ~np.isfinite(view['depthmap'])
+                n_nan = nan_mask.sum()
+                print(f"⚠️ NaN/Inf in depthmap for view {view_name(view)}; replacing with -1 and masking ({n_nan} pixels)")
+                view['depthmap'] = np.where(nan_mask, -1.0, view['depthmap'])
+            # keep a reference to mask for later filtering
+            # If no NaN/Inf found, create an empty mask (all False) instead of None
+            if nan_mask is None:
+                nan_mask = np.zeros(view['depthmap'].shape, dtype=bool)
+            view['_nan_mask_depthmap'] = nan_mask
 
             pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
 
             view['pts3d'] = pts3d
             view['valid_mask'] = valid_mask & np.isfinite(pts3d).all(axis=-1)
+            if nan_mask is not None:
+                view['valid_mask'] &= (~nan_mask) & (view['depthmap'] > 0)
 
         self.generate_crops_from_pair(views[0], views[1], resolution=resolution,
                                       aug_crop_arg=self.aug_crop,

@@ -24,20 +24,58 @@ def reg_desc(desc, mode):
     return desc
 
 
-def postprocess(out, depth_mode, conf_mode, desc_dim=None, desc_mode='norm', two_confs=False, desc_conf_mode=None):
+def postprocess(out, depth_mode, conf_mode, desc_dim=None, desc_mode='norm', two_confs=False, desc_conf_mode=None, 
+                predict_underwater_params=False, fix_background_color_from_depth=False):
+    """
+    Postprocess model output.
+    
+    Args:
+        predict_underwater_params: If True, extract β_1, β_2, B_inf from output
+        fix_background_color_from_depth: If True, only predict β_1 and β_2 (6 channels), B_inf is fixed
+    """
     if desc_conf_mode is None:
         desc_conf_mode = conf_mode
     fmap = out.permute(0, 2, 3, 1)  # B,H,W,D
     res = dict(pts3d=reg_dense_depth(fmap[..., 0:3], mode=depth_mode))
+    start_idx = 3
     if conf_mode is not None:
-        res['conf'] = reg_dense_conf(fmap[..., 3], mode=conf_mode)
+        res['conf'] = reg_dense_conf(fmap[..., start_idx], mode=conf_mode)
+        start_idx += 1
     if desc_dim is not None:
-        start = 3 + int(conf_mode is not None)
-        res['desc'] = reg_desc(fmap[..., start:start + desc_dim], mode=desc_mode)
+        res['desc'] = reg_desc(fmap[..., start_idx:start_idx + desc_dim], mode=desc_mode)
+        start_idx += desc_dim
         if two_confs:
-            res['desc_conf'] = reg_dense_conf(fmap[..., start + desc_dim], mode=desc_conf_mode)
+            res['desc_conf'] = reg_dense_conf(fmap[..., start_idx], mode=desc_conf_mode)
+            start_idx += 1
         else:
             res['desc_conf'] = res['conf'].clone()
+    
+    # Extract underwater parameters: β_1, β_2 (RGB each), B_inf (RGB)
+    # If fix_background_color_from_depth=True: only β_1, β_2 (6 channels)
+    # Otherwise: β_1, β_2, B_inf (9 channels)
+    if predict_underwater_params:
+        remaining_dims = fmap.shape[-1] - start_idx
+        if fix_background_color_from_depth:
+            # Only predict β_1 and β_2 (6 channels)
+            if remaining_dims >= 6:
+                beta_1_raw = fmap[..., start_idx:start_idx + 3]  # [B, H, W, 3]
+                beta_2_raw = fmap[..., start_idx + 3:start_idx + 6]  # [B, H, W, 3]
+                
+                # Apply activation functions to constrain values
+                res['beta_1'] = torch.sigmoid(beta_1_raw) * 0.5  # [0, 0.5] range
+                res['beta_2'] = torch.sigmoid(beta_2_raw) * 0.5  # [0, 0.5] range
+                # B_inf will be set from view data in forward pass
+        else:
+            # Predict all 9 channels (β_1, β_2, B_inf)
+            if remaining_dims >= 9:
+                beta_1_raw = fmap[..., start_idx:start_idx + 3]  # [B, H, W, 3]
+                beta_2_raw = fmap[..., start_idx + 3:start_idx + 6]  # [B, H, W, 3]
+                b_inf_raw = fmap[..., start_idx + 6:start_idx + 9]  # [B, H, W, 3]
+                
+                # Apply activation functions to constrain values
+                res['beta_1'] = torch.sigmoid(beta_1_raw) * 0.5  # [0, 0.5] range
+                res['beta_2'] = torch.sigmoid(beta_2_raw) * 0.5  # [0, 0.5] range
+                res['b_inf'] = torch.sigmoid(b_inf_raw)  # [0, 1] range
     return res
 
 
@@ -64,11 +102,26 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d(PixelwiseTaskWithDPT):
         self.has_conf = has_conf
         self.two_confs = net.two_confs  # independent confs for 3D regr and descs
         self.desc_conf_mode = net.desc_conf_mode
+        self.predict_underwater_params = getattr(net, 'predict_underwater_params', False)
+        self.fix_background_color_from_depth = getattr(net, 'fix_background_color_from_depth', False)
         idim = net.enc_embed_dim + net.dec_embed_dim
 
+        # Local features head (descriptors + confidence)
+        # Keep original output dimension to load pretrained weights
+        local_feat_dim = self.local_feat_dim + self.two_confs
         self.head_local_features = Mlp(in_features=idim,
                                        hidden_features=int(hidden_dim_factor * idim),
-                                       out_features=(self.local_feat_dim + self.two_confs) * self.patch_size**2)
+                                       out_features=local_feat_dim * self.patch_size**2)
+        
+        # Separate underwater parameters head
+        # If fix_background_color_from_depth=True: only β_1, β_2 (6 channels)
+        # Otherwise: β_1, β_2, B_inf (9 channels)
+        # This head is randomly initialized and trained from scratch
+        if self.predict_underwater_params:
+            num_underwater_channels = 6 if self.fix_background_color_from_depth else 9
+            self.head_underwater_params = Mlp(in_features=idim,
+                                             hidden_features=int(hidden_dim_factor * idim),
+                                             out_features=num_underwater_channels * self.patch_size**2)
 
     def forward(self, decout, img_shape):
         # pass through the heads
@@ -80,10 +133,18 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d(PixelwiseTaskWithDPT):
         H, W = img_shape
         B, S, D = cat_output.shape
 
-        # extract local_features
+        # extract local_features (descriptors + confidence) using pretrained weights
         local_features = self.head_local_features(cat_output)  # B,S,D
         local_features = local_features.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
         local_features = F.pixel_shuffle(local_features, self.patch_size)  # B,d,H,W
+        
+        # extract underwater parameters (β_1, β_2, B_inf) using separate head
+        if self.predict_underwater_params:
+            underwater_params = self.head_underwater_params(cat_output)  # B,S,9*patch_size^2
+            underwater_params = underwater_params.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
+            underwater_params = F.pixel_shuffle(underwater_params, self.patch_size)  # B,9,H,W
+            # concatenate local_features and underwater_params
+            local_features = torch.cat([local_features, underwater_params], dim=1)
 
         # post process 3D pts, descriptors and confidences
         out = torch.cat([pts3d, local_features], dim=1)
@@ -94,7 +155,9 @@ class Cat_MLP_LocalFeatures_DPT_Pts3d(PixelwiseTaskWithDPT):
                                    desc_dim=self.local_feat_dim,
                                    desc_mode=self.desc_mode,
                                    two_confs=self.two_confs,
-                                   desc_conf_mode=self.desc_conf_mode)
+                                   desc_conf_mode=self.desc_conf_mode,
+                                   predict_underwater_params=self.predict_underwater_params,
+                                   fix_background_color_from_depth=self.fix_background_color_from_depth)
         return out
 
 
@@ -167,6 +230,8 @@ class Cat_MLP_LocalFeatures_MiniConv_Pts3d(nn.Module):
         self.desc_conf_mode = net.desc_conf_mode
         self.has_conf = has_conf
         self.two_confs = net.two_confs  # independent confs for 3D regr and descs
+        self.predict_underwater_params = getattr(net, 'predict_underwater_params', False)
+        self.fix_background_color_from_depth = getattr(net, 'fix_background_color_from_depth', False)
         idim = net.enc_embed_dim + net.dec_embed_dim
         self.head_pts3d = MLP_MiniConv_Head(idim=idim,
                                             mlp_hidden_dim=int(hidden_dim_factor * idim),
@@ -177,9 +242,22 @@ class Cat_MLP_LocalFeatures_MiniConv_Pts3d(nn.Module):
                                             patch_size=self.patch_size,
                                             **kw)
 
+        # Local features head (descriptors + confidence)
+        # Keep original output dimension to load pretrained weights
+        local_feat_dim = self.local_feat_dim + self.two_confs
         self.head_local_features = Mlp(in_features=idim,
                                        hidden_features=int(hidden_dim_factor * idim),
-                                       out_features=(self.local_feat_dim + self.two_confs) * self.patch_size**2)
+                                       out_features=local_feat_dim * self.patch_size**2)
+        
+        # Separate underwater parameters head
+        # If fix_background_color_from_depth=True: only β_1, β_2 (6 channels)
+        # Otherwise: β_1, β_2, B_inf (9 channels)
+        # This head is randomly initialized and trained from scratch
+        if self.predict_underwater_params:
+            num_underwater_channels = 6 if self.fix_background_color_from_depth else 9
+            self.head_underwater_params = Mlp(in_features=idim,
+                                             hidden_features=int(hidden_dim_factor * idim),
+                                             out_features=num_underwater_channels * self.patch_size**2)
 
     def forward(self, decout, img_shape):
         enc_output, dec_output = decout[0], decout[-1]  # recover encoder and decoder outputs
@@ -190,10 +268,19 @@ class Cat_MLP_LocalFeatures_MiniConv_Pts3d(nn.Module):
         H, W = img_shape
         B, S, D = cat_output.shape
 
-        # extract 3D points
+        # extract local_features (descriptors + confidence) using pretrained weights
         local_features = self.head_local_features(cat_output)  # B,S,D
         local_features = local_features.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
         local_features = F.pixel_shuffle(local_features, self.patch_size)  # B,d,H,W
+        
+        # extract underwater parameters (β_1, β_2, B_inf) using separate head
+        if self.predict_underwater_params:
+            num_channels = 6 if self.fix_background_color_from_depth else 9
+            underwater_params = self.head_underwater_params(cat_output)  # B,S,num_channels*patch_size^2
+            underwater_params = underwater_params.transpose(-1, -2).view(B, -1, H // self.patch_size, W // self.patch_size)
+            underwater_params = F.pixel_shuffle(underwater_params, self.patch_size)  # B,num_channels,H,W
+            # concatenate local_features and underwater_params
+            local_features = torch.cat([local_features, underwater_params], dim=1)
 
         # post process 3D pts, descriptors and confidences
         out = postprocess(torch.cat([pts3d, local_features], dim=1),
@@ -201,7 +288,10 @@ class Cat_MLP_LocalFeatures_MiniConv_Pts3d(nn.Module):
                           conf_mode=self.conf_mode,
                           desc_dim=self.local_feat_dim,
                           desc_mode=self.desc_mode,
-                          two_confs=self.two_confs, desc_conf_mode=self.desc_conf_mode)
+                          two_confs=self.two_confs,
+                          desc_conf_mode=self.desc_conf_mode,
+                          predict_underwater_params=self.predict_underwater_params,
+                          fix_background_color_from_depth=self.fix_background_color_from_depth)
         return out
 
 

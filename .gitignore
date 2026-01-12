@@ -2,6 +2,7 @@ data/
 checkpoints/
 **/output_mast3r_*/
 **/evaluation_results_mast3r/
+**/test_visualizations/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

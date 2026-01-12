@@ -37,12 +37,75 @@ def load_model(model_path, device, verbose=True):
             if verbose:
                 print(f"  Added output_mode='pts3d+desc24' for head_type='catmlp+dpt'")
     
+    # Check if checkpoint has underwater_params head and adjust model structure to match checkpoint
+    # Note: Model structure must match checkpoint structure to load weights properly
+    # The fix_background_color_from_depth flag only affects postprocessing (which channels are used)
+    original_fix_bg_from_depth = None
+    checkpoint_channels = None
+    
+    if 'predict_underwater_params' in args and 'head_underwater_params' in str(ckpt.get('model', {}).keys()):
+        # Find the fc2 weight shape for head_underwater_params
+        for key in ckpt['model'].keys():
+            if 'head_underwater_params.fc2.weight' in key:
+                actual_out_features = ckpt['model'][key].shape[0]
+                # Determine number of channels: out_features = num_channels * patch_size^2
+                # Assume patch_size=16 (standard), so patch_size^2 = 256
+                patch_size_sq = 256  # default patch_size=16
+                checkpoint_channels = actual_out_features // patch_size_sq
+                
+                # Save original fix_background_color_from_depth value
+                if "fix_background_color_from_depth=True" in args:
+                    original_fix_bg_from_depth = True
+                elif "fix_background_color_from_depth=False" in args:
+                    original_fix_bg_from_depth = False
+                
+                if checkpoint_channels == 9:
+                    # Checkpoint has 9 channels - model must be built with 9 channels to match
+                    # Temporarily set fix_background_color_from_depth=False to build 9-channel model
+                    if "fix_background_color_from_depth=True" in args:
+                        args = args.replace("fix_background_color_from_depth=True", "fix_background_color_from_depth=False")
+                        if verbose:
+                            print(f"  ⚠️  Checkpoint has {checkpoint_channels} channels in head_underwater_params")
+                            print(f"     Temporarily setting fix_background_color_from_depth=False to match checkpoint structure")
+                            print(f"     (Will restore original value after loading to control postprocessing)")
+                elif checkpoint_channels == 6:
+                    # Checkpoint has 6 channels - model must be built with 6 channels to match
+                    if "fix_background_color_from_depth=False" in args:
+                        args = args.replace("fix_background_color_from_depth=False", "fix_background_color_from_depth=True")
+                        if verbose:
+                            print(f"  Updated fix_background_color_from_depth=True based on checkpoint (6 channels detected)")
+                break
+    
     if verbose:
         print(f"instantiating : {args}")
     net = eval(args)
     s = net.load_state_dict(ckpt['model'], strict=False)
     if verbose:
         print(s)
+    
+    # Restore original fix_background_color_from_depth value if it was changed
+    # This affects postprocessing behavior (which channels are used), not model structure
+    if original_fix_bg_from_depth is not None and checkpoint_channels == 9:
+        if original_fix_bg_from_depth:
+            # Restore to True - postprocess will use only first 6 channels (β_1, β_2), ignore B_inf
+            net.fix_background_color_from_depth = True
+            # Also update the head's fix_background_color_from_depth attribute
+            if hasattr(net, 'downstream_head1') and hasattr(net.downstream_head1, 'fix_background_color_from_depth'):
+                net.downstream_head1.fix_background_color_from_depth = True
+            if hasattr(net, 'downstream_head2') and hasattr(net.downstream_head2, 'fix_background_color_from_depth'):
+                net.downstream_head2.fix_background_color_from_depth = True
+            if verbose:
+                print(f"  ✅ Restored fix_background_color_from_depth=True")
+                print(f"     Model structure: 9 channels (matches checkpoint)")
+                print(f"     Postprocessing: will use only first 6 channels (β_1, β_2), B_inf fixed from depth")
+        else:
+            # Keep False - postprocess will use all 9 channels
+            net.fix_background_color_from_depth = False
+            if verbose:
+                print(f"  ✅ fix_background_color_from_depth=False")
+                print(f"     Model structure: 9 channels (matches checkpoint)")
+                print(f"     Postprocessing: will use all 9 channels (β_1, β_2, B_inf)")
+    
     return net.to(device)
 
 
